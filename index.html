@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>CanteenOS | Canteen Counter</title>
+    <title>CanteenOS | Redemption Counter</title>
     
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -39,11 +39,10 @@
         .font-mono { font-family: 'JetBrains Mono', monospace; }
         
         .scanner-input { 
-            letter-spacing: 0.2em; 
+            letter-spacing: 0.15em; 
             font-weight: 800; 
             caret-color: transparent;
         }
-        
         /* Custom Scrollbar */
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: #f1f5f9; }
@@ -63,18 +62,18 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, addDoc, query, where, getDocs, updateDoc, doc, onSnapshot, serverTimestamp, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, query, where, getDocs, updateDoc, doc, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // ============================================================
         //  FIREBASE CONFIGURATION
         // ============================================================
         const firebaseConfig = {
-            apiKey: "AIzaSyAfKp8gWavPxo5EZafetpeADh7eeRHQQx0",
-            authDomain: "canteen-2d80d.firebaseapp.com",
-            projectId: "canteen-2d80d",
-            storageBucket: "canteen-2d80d.firebasestorage.app",
-            messagingSenderId: "835222412943",
-            appId: "1:835222412943:web:8db25547c45a1f0e1d5afa"
+            apiKey: import.meta.env?.VITE_FIREBASE_API_KEY || "AIzaSyAfKp8gWavPxo5EZafetpeADh7eeRHQQx0",
+            authDomain: import.meta.env?.VITE_FIREBASE_AUTH_DOMAIN || "canteen-2d80d.firebaseapp.com",
+            projectId: import.meta.env?.VITE_FIREBASE_PROJECT_ID || "canteen-2d80d",
+            storageBucket: import.meta.env?.VITE_FIREBASE_STORAGE_BUCKET || "canteen-2d80d.firebasestorage.app",
+            messagingSenderId: import.meta.env?.VITE_FIREBASE_MESSAGING_SENDER_ID || "835222412943",
+            appId: import.meta.env?.VITE_FIREBASE_APP_ID || "1:835222412943:web:8db25547c45a1f0e1d5afa"
         };
         
         let appConfig = firebaseConfig;
@@ -93,29 +92,29 @@
         const appId = (typeof __app_id !== 'undefined') ? __app_id : 'canteen-os-live';
 
         // --- Data Handling ---
-        // IN-MEMORY CACHE FOR HIGH SPEED
-        let EMPLOYEES = {};
         let SYSTEM_USERS = {}; 
-        let TODAY_TOKENS = {}; // Map for O(1) validation check
-        let ALL_TODAY_TOKENS_DATA = []; // Array to store raw data for rendering
+        let RAW_TODAY_TOKENS = []; // Store full objects for UI filtering
+        let EMPLOYEES = {}; // Fast cache for live status checking
+        
         let html5QrcodeScanner = null;
         let scanDebounceTimer = null;
+        let resultModalTimer = null;
 
         // --- State ---
         let currentUser = null; 
         let loggedInSysUser = null; 
         let dataLoaded = false;
-        const SYS_SESSION_KEY = `canteen_sys_session_${appId}`;
+        
+        // FIX: Synchronized global session key for stability across reloads
+        const SYS_SESSION_KEY = `ent_sys_session_${appId}`;
 
         // Auto Logout Timer
         let idleTime = 0;
-        const MAX_IDLE_TIME = 120; // 120 Seconds
-
-        let unsubscribeCanteen = null;
+        const MAX_IDLE_TIME = 3600; // Increased to 1 hour to prevent annoying auto-logs during slow periods
 
         const views = {
             login: document.getElementById('view-login'), 
-            canteen: document.getElementById('view-canteen'),
+            counter: document.getElementById('view-counter'),
             loading: document.getElementById('view-loading')
         };
         const navBar = document.getElementById('main-nav');
@@ -165,130 +164,47 @@
             }
         };
 
-        function getTodayStr() { return new Date().toISOString().split('T')[0]; }
-
-        // --- RENDER FUNCTION FOR LIST ---
-        window.renderCanteenUI = () => {
-            if (!loggedInSysUser) return; // Don't render if not logged in
-
-            const list = document.getElementById('can-recent-list');
-            const countEl = document.getElementById('can-today-count'); // My Served
-            const issuedCountEl = document.getElementById('stats-issued'); // Total Issued (KDC/MOVEIT/KDC VAS)
-            const totalServedEl = document.getElementById('stats-total-served'); // Total Served (KDC/MOVEIT/KDC VAS)
-
-            list.innerHTML = '';
-
-            // --- CALCULATE STATS ---
-            let myServedCount = 0;
-            let siteIssuedCount = 0;
-            let siteConsumedCount = 0;
-
-            let myServedTokens = [];
-
-            ALL_TODAY_TOKENS_DATA.forEach(t => {
-                // Get Employee Info
-                const emp = EMPLOYEES[t.empId];
-                if (!emp || !emp.site) return;
-
-                // Check Site Authorization (KDC, KDC VAS, MOVEIT)
-                const site = emp.site.toUpperCase();
-                const isAuthorizedSite = site.includes('KDC') || site.includes('MOVEIT') || site.includes('KDC VAS');
-
-                if (isAuthorizedSite) {
-                    siteIssuedCount++;
-                    
-                    if (t.status === 'CONSUMED') {
-                        siteConsumedCount++;
-                        
-                        // Check if served by THIS terminal
-                        if (t.consumedBySysUser === loggedInSysUser.username) {
-                            myServedTokens.push(t);
-                            myServedCount++;
-                        }
-                    }
-                }
-            });
-
-            // Update Counters
-            if(countEl) countEl.textContent = myServedCount;
-            if(issuedCountEl) issuedCountEl.textContent = siteIssuedCount;
-            if(totalServedEl) totalServedEl.textContent = siteConsumedCount;
-
-            // Sort by consumed time (Newest First)
-            myServedTokens.sort((a, b) => {
-                const tA = a.consumedAt ? a.consumedAt.seconds : 0;
-                const tB = b.consumedAt ? b.consumedAt.seconds : 0;
-                return tB - tA;
-            });
-
-            // Render List (My Served Only)
-            myServedTokens.slice(0, 50).forEach(data => {
-                const el = document.createElement('div');
-                el.className = 'flex justify-between items-center p-4 border-b border-slate-100 dark:border-slate-700/50 last:border-0 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors rounded-xl animate-fade-in';
-                
-                const empPhoto = EMPLOYEES[data.empId]?.photoData;
-                const avatarHtml = empPhoto 
-                    ? `<img src="${empPhoto}" class="h-10 w-10 rounded-full object-cover mr-4 border border-emerald-200 dark:border-emerald-800 shadow-sm">`
-                    : `<div class="h-10 w-10 rounded-full bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 flex items-center justify-center font-bold text-sm mr-4 shadow-sm">${data.empName.charAt(0)}</div>`;
-
-                const timeStr = data.consumedAt ? new Date(data.consumedAt.seconds*1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : 'Just now';
-
-                el.innerHTML = `
-                    <div class="flex items-center">
-                        ${avatarHtml}
-                        <div>
-                            <div class="font-bold text-slate-800 dark:text-white text-sm">${data.empName}</div>
-                            <div class="text-xs text-slate-500 dark:text-slate-400 font-medium">${data.dept}</div>
-                        </div>
-                    </div>
-                    <div class="text-right">
-                        <span class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 uppercase tracking-wide">Served</span>
-                        <div class="text-[10px] text-slate-400 dark:text-slate-500 mt-1.5 font-medium">${timeStr}</div>
-                    </div>
-                `;
-                list.appendChild(el);
-            });
-        };
-
         const loadData = () => {
             if (!auth.currentUser) return;
+            const todayStr = getTodayStr();
 
-            // 1. Load System Users (Auth)
+            // 1. Load System Users for Login (With Error Handler to prevent hanging)
             onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'system_users')), (snapshot) => {
                 snapshot.forEach(doc => SYSTEM_USERS[doc.id] = doc.data());
                 if (!dataLoaded) {
                     dataLoaded = true;
                     checkAuthRouting();
                 }
+            }, (error) => {
+                console.warn("System Users offline/fetch error:", error);
+                if (!dataLoaded) {
+                    dataLoaded = true;
+                    checkAuthRouting();
+                }
             });
 
-            // 2. Load Employees (For Photo/Name verification) - Cache in memory
+            // 2. Load Employees for LIVE active status verification at the point of redemption
             onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'employees')), (snapshot) => {
                 snapshot.forEach(doc => EMPLOYEES[doc.id] = doc.data());
-            });
+            }, (err) => console.error("Emp fetch err", err));
 
-            // 3. Load Today's Tokens (For fast validation status check)
-            // We listen to ALL tokens for today to ensure we know if someone checked in at Security Desk.
-            const todayStr = getTodayStr();
-            const qTokens = query(collection(db, 'artifacts', appId, 'public', 'data', 'tokens'), where('issuedDate', '==', todayStr));
+            // 3. Load TODAY'S TOKENS (With Error Handler to prevent hanging)
+            const tokenQuery = query(collection(db, 'artifacts', appId, 'public', 'data', 'tokens'), where('issuedDate', '==', todayStr));
             
-            unsubscribeCanteen = onSnapshot(qTokens, (snapshot) => {
-                TODAY_TOKENS = {}; // Reset cache map
-                ALL_TODAY_TOKENS_DATA = []; // Reset raw list
+            onSnapshot(tokenQuery, (snapshot) => {
+                RAW_TODAY_TOKENS = []; 
+                snapshot.forEach(doc => RAW_TODAY_TOKENS.push({ id: doc.id, ...doc.data() }));
 
-                snapshot.forEach(docSnap => {
-                    const data = docSnap.data();
-                    const docId = docSnap.id;
-                    
-                    // Map for O(1) lookup during scanning (MUST contain everyone for validation)
-                    TODAY_TOKENS[data.empId] = { id: docId, ...data };
-                    
-                    // Array for UI Rendering
-                    ALL_TODAY_TOKENS_DATA.push({ id: docId, ...data });
-                });
-
-                // Update UI based on current user
-                renderCanteenUI();
+                // Update UI if on Counter View
+                if (!views.counter.classList.contains('hidden')) {
+                    updateDashboard();
+                }
+            }, (error) => {
+                console.warn("Tokens offline/fetch error:", error);
+                showToast("Operating in offline/cached mode", "error");
+                if (!views.counter.classList.contains('hidden')) {
+                    updateDashboard();
+                }
             });
         };
 
@@ -325,7 +241,8 @@
             const sessionStr = localStorage.getItem(SYS_SESSION_KEY);
             if (sessionStr) {
                 const session = JSON.parse(sessionStr);
-                const sysUser = SYSTEM_USERS[session.username];
+                // Fallback to session details if SYSTEM_USERS is empty due to offline mode
+                const sysUser = SYSTEM_USERS[session.username] || session;
                 
                 // Master Admin
                 if (session.username === 'ADMIN' && session.date === getTodayStr()) {
@@ -366,11 +283,18 @@
             if (user && user.pin === p && user.status === 'ACTIVE') {
                 if (user.role === 'CANTEEN' || user.role === 'ADMIN') {
                     loggedInSysUser = user;
-                    localStorage.setItem(SYS_SESSION_KEY, JSON.stringify({ username: u, date: getTodayStr() }));
+                    // Save full user details in session to support seamless offline reloads
+                    localStorage.setItem(SYS_SESSION_KEY, JSON.stringify({ 
+                        username: u, 
+                        name: user.name, 
+                        role: user.role, 
+                        status: user.status,
+                        date: getTodayStr() 
+                    }));
                     errEl.classList.add('hidden');
                     proceedToApp();
                 } else {
-                    errEl.textContent = "Access Denied: Invalid Role for Canteen";
+                    errEl.textContent = "Access Denied: Invalid Role for Canteen Terminal";
                     errEl.classList.remove('hidden');
                 }
             } else {
@@ -387,22 +311,24 @@
         };
 
         function proceedToApp() {
-            showView('canteen');
+            showView('counter');
             navBar.classList.remove('hidden');
             roleDisplay.textContent = `${loggedInSysUser.name} (${loggedInSysUser.role})`;
             
-            // Trigger UI refresh so the list shows ONLY this user's served meals
-            renderCanteenUI();
-
-            // Focus Input
-            const input = document.getElementById('can-emp-id');
-            if(input) { input.value = ''; input.focus(); }
+            updateDashboard();
+            
+            setTimeout(() => {
+                const input = document.getElementById('canteen-scanner');
+                if(input) { input.value = ''; input.focus(); }
+            }, 500);
         }
 
         function showView(viewName) {
             Object.values(views).forEach(el => el && el.classList.add('hidden'));
             if(views[viewName]) views[viewName].classList.remove('hidden');
         }
+
+        function getTodayStr() { return new Date().toISOString().split('T')[0]; }
 
         function showToast(message, type = 'info') {
             const toast = document.getElementById('toast');
@@ -414,17 +340,160 @@
             setTimeout(() => toast.classList.add('translate-y-20', 'opacity-0'), 3000);
         }
 
+        // --- DASHBOARD UPDATES (Metrics & List) ---
+        function updateDashboard() {
+            const list = document.getElementById('canteen-list');
+            if (!list) return;
+
+            // 1. Calculate Metrics (Global Meals tracking for both KDC/ALC now)
+            const allTokens = RAW_TODAY_TOKENS;
+            const redeemedTokens = allTokens.filter(t => t.status === 'CONSUMED' || t.mealRedeemed === true);
+            
+            document.getElementById('stat-issued-alc').innerText = allTokens.length;
+            document.getElementById('stat-redeemed-emp').innerText = redeemedTokens.length;
+
+            // 2. Meal Breakdown Tracker
+            const mealCounts = {};
+            allTokens.forEach(t => {
+                if (t.mealName && t.mealName.trim() !== '') {
+                    const meal = t.mealName;
+                    if(!mealCounts[meal]) mealCounts[meal] = { assigned: 0, redeemed: 0 };
+                    mealCounts[meal].assigned++;
+                    if(t.status === 'CONSUMED' || t.mealRedeemed) mealCounts[meal].redeemed++;
+                }
+            });
+
+            let breakdownHtml = '';
+            Object.entries(mealCounts).sort((a,b) => b[1].assigned - a[1].assigned).forEach(([meal, counts]) => {
+                breakdownHtml += `
+                    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-4 py-3 rounded-xl flex justify-between items-center shadow-sm">
+                        <span class="text-xs font-bold text-orange-500 uppercase tracking-widest"><i class="fas fa-concierge-bell mr-1.5 opacity-50"></i>${meal}</span>
+                        <div class="bg-slate-100 dark:bg-slate-900 text-slate-600 dark:text-slate-300 font-black px-3 py-1 rounded-lg text-sm border border-slate-200 dark:border-slate-700">
+                            <span class="text-emerald-500 dark:text-emerald-400">${counts.redeemed}</span> <span class="opacity-50 text-xs">/ ${counts.assigned}</span>
+                        </div>
+                    </div>`;
+            });
+            
+            if (Object.keys(mealCounts).length === 0) {
+                breakdownHtml = `<div class="col-span-full text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-4 py-3 border border-slate-200 dark:border-slate-700 rounded-xl bg-slate-50 dark:bg-slate-800/50"><i class="fas fa-info-circle mr-2"></i> No specific meals assigned today</div>`;
+            }
+            document.getElementById('meal-breakdown-container').innerHTML = breakdownHtml;
+
+            // 3. Render Live Ledger List
+            list.innerHTML = '';
+            
+            // Sort: Latest actions at the top (Consumed first, then Issued)
+            let sortedTokens = [...RAW_TODAY_TOKENS].sort((a, b) => {
+                const timeA = a.consumedAt?.seconds || a.issuedAt?.seconds || 0;
+                const timeB = b.consumedAt?.seconds || b.issuedAt?.seconds || 0;
+                return timeB - timeA;
+            });
+
+            sortedTokens.slice(0, 50).forEach(log => {
+                const initial = String(log.empName || '?').charAt(0).toUpperCase();
+                const isRedeemed = log.status === 'CONSUMED' || log.mealRedeemed === true;
+                
+                const mealLabel = log.mealName ? `<span class="text-[9px] uppercase font-bold text-orange-500 dark:text-orange-400 tracking-wider bg-orange-100 dark:bg-orange-500/10 px-2 py-0.5 rounded ml-2 border border-orange-200 dark:border-orange-500/20">${log.mealName}</span>` : '';
+                const displayDept = log.dept || '-';
+                
+                let timeStr = 'Pending';
+                if (isRedeemed && log.consumedAt) {
+                    timeStr = new Date(log.consumedAt.seconds * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                } else if (log.issuedAt) {
+                    timeStr = new Date(log.issuedAt.seconds * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                }
+
+                const cardStyle = isRedeemed ? 'bg-emerald-50 dark:bg-emerald-900/10 border-emerald-100 dark:border-emerald-900/40' : 'bg-white dark:bg-slate-800/50 border-slate-100 dark:border-slate-700/50';
+                const avatarStyle = isRedeemed ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400' : 'bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400';
+                
+                const statusBadge = isRedeemed 
+                    ? `<div class="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400 font-extrabold text-[10px] bg-emerald-100 dark:bg-emerald-900/30 px-2.5 py-1.5 rounded-lg uppercase tracking-wide border border-emerald-200 dark:border-emerald-800/50"><i class="fas fa-check-double"></i> <span>Redeemed</span></div>`
+                    : `<div class="flex items-center gap-1.5 text-amber-600 dark:text-amber-400 font-extrabold text-[10px] bg-amber-100 dark:bg-amber-900/30 px-2.5 py-1.5 rounded-lg uppercase tracking-wide border border-amber-200 dark:border-amber-800/50"><i class="fas fa-clock"></i> <span>Waiting</span></div>`;
+
+                const el = document.createElement('div');
+                el.className = `flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 rounded-2xl border ${cardStyle} hover:shadow-md transition-all duration-300 mb-3 animate-fade-in`;
+                
+                el.innerHTML = `
+                    <div class="flex items-center gap-4 shrink-0 overflow-hidden w-full sm:w-auto mb-3 sm:mb-0">
+                        <div class="w-10 h-10 rounded-full shrink-0 ${avatarStyle} flex items-center justify-center font-bold text-sm shadow-sm">
+                            ${initial}
+                        </div>
+                        <div class="min-w-0">
+                            <h4 class="font-bold text-slate-800 dark:text-white text-sm truncate">${log.empName || 'Unknown'}</h4>
+                            <div class="text-[11px] text-slate-500 dark:text-slate-400 flex items-center mt-1 flex-wrap gap-2">
+                                <span class="font-mono bg-slate-100 dark:bg-slate-700 px-1.5 py-0.5 rounded border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-200">${log.empId || '-'}</span>
+                                <span class="truncate">${displayDept}</span>
+                                <span class="${isRedeemed ? 'text-emerald-500' : 'text-slate-400'} ml-1"><i class="far fa-clock"></i> ${timeStr}</span>
+                                ${mealLabel}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="shrink-0 w-full sm:w-auto sm:pl-2 flex justify-end">
+                        <div class="flex items-center gap-2">
+                            ${statusBadge}
+                        </div>
+                    </div>
+                `;
+                list.appendChild(el);
+            });
+
+            if (sortedTokens.length === 0) {
+                list.innerHTML = `<div class="text-center py-12 text-slate-400 dark:text-slate-500 flex flex-col items-center"><i class="fas fa-clipboard-list mb-3 text-3xl opacity-50"></i><p class="font-bold text-sm">No tokens issued by security today.</p></div>`;
+            }
+        }
+
         // --- SCANNING LOGIC ---
-        window.executeScan = (val) => {
-            if (!val) return;
-            processCanteenScan(val); // Directly call logic, UI update handles latency
+        window.executeScan = async (val) => {
+            if (!val || !auth.currentUser) return;
+            showScanResultModal('VERIFYING...', 'Processing...', 'info');
+
+            // 1. Verify Token exists
+            const token = RAW_TODAY_TOKENS.find(t => t.empId === val || t.id === val);
+
+            if (!token) {
+                return showScanResultModal('ACCESS DENIED', 'No valid token issued for today.\nPlease visit Security Check-in.', 'error', 3000);
+            }
+
+            // 2. CRITICAL: Live Verify Employee Status is still ACTIVE
+            // Even if a token was issued earlier, block redemption if HR marked them inactive midway through the day.
+            const empProfile = EMPLOYEES[token.empId];
+            if (empProfile && empProfile.status === 'INACTIVE') {
+                return showScanResultModal('ACCESS REVOKED', `Employee profile for ${token.empName} is currently marked INACTIVE. Cannot redeem meal.`, 'error', 5000);
+            }
+
+            // 3. Verify Token hasn't already been used
+            if (token.status === 'CONSUMED' || token.mealRedeemed === true) {
+                const mealMsg = token.mealName ? ` (${token.mealName})` : '';
+                return showScanResultModal('ALREADY REDEEMED', `${token.empName} has already collected their meal${mealMsg}.`, 'error', 4000);
+            }
+
+            // 4. Approve and Mark Consumed
+            try {
+                const ref = doc(db, 'artifacts', appId, 'public', 'data', 'tokens', token.id);
+                await updateDoc(ref, {
+                    status: 'CONSUMED',
+                    mealRedeemed: true,
+                    consumedAt: serverTimestamp(),
+                    consumedBy: auth.currentUser.uid,
+                    consumedBySysUser: loggedInSysUser?.username || 'SYSTEM'
+                });
+                
+                // Show 5-second notification modal detailing what meal to provide
+                const mealMsg = token.mealName ? `\nProvide Meal: ${token.mealName}` : '\nProvide: Standard Meal';
+                showScanResultModal('MEAL APPROVED', `${token.empName}${mealMsg}`, 'success', 5000); 
+
+            } catch (e) {
+                console.error("Error updating document:", e);
+                showScanResultModal('NETWORK DELAY', 'Failed to reach cloud database. Operating offline.', 'error', 3000);
+            }
         };
 
         window.handleScannerInput = (event) => {
             if (event.key === 'Enter') {
                 if(scanDebounceTimer) clearTimeout(scanDebounceTimer);
                 executeScan(event.target.value.trim().toUpperCase());
-                event.target.value = ''; event.target.focus();
+                event.target.value = ''; 
+                event.target.focus();
             }
         };
 
@@ -436,62 +505,19 @@
                     executeScan(val);
                     event.target.value = ''; event.target.focus();
                 }
-            }, 10);
+            }, 50);
         };
 
         window.keepFocus = () => {
-            setTimeout(() => {
-                const el = document.getElementById('can-emp-id');
-                if(el && document.activeElement !== el) el.focus();
-            }, 100);
+            const modal = document.getElementById('result-modal');
+            const webcam = document.getElementById('webcam-modal');
+            if (modal.classList.contains('hidden') && webcam.classList.contains('hidden')) {
+                setTimeout(() => {
+                    const el = document.getElementById('canteen-scanner');
+                    if(el && document.activeElement !== el) el.focus();
+                }, 100);
+            }
         };
-
-        // --- CORE CANTEEN LOGIC (OPTIMIZED FOR SPEED) ---
-        async function processCanteenScan(empId) {
-            // 1. FAST LOCAL CHECK: Employee Exists?
-            const emp = EMPLOYEES[empId];
-            if(!emp) return showScanResultModal('ACCESS DENIED', 'Invalid ID Card', 'error');
-
-            // --- SITE RESTRICTION (KDC, KDC VAS, MOVEIT) ---
-            const empSite = emp.site ? emp.site.toUpperCase() : '';
-            if (!empSite.includes('KDC') && !empSite.includes('MOVEIT') && !empSite.includes('KDC VAS')) {
-                return showScanResultModal('RESTRICTED SITE', 'Only KDC/MOVEIT/KDC VAS allowed.', 'error', emp.photoData);
-            }
-
-            // 2. FAST LOCAL CHECK: Token Exists for Today?
-            // TODAY_TOKENS is maintained in real-time by onSnapshot
-            const token = TODAY_TOKENS[empId];
-
-            if (!token) {
-                // No record found for today
-                return showScanResultModal('ACCESS DENIED', `Not cleared at Security Desk.`, 'error');
-            }
-
-            if (token.status === 'CONSUMED') {
-                // Already ate
-                return showScanResultModal('ALREADY REDEEMED', `${token.empName} meal fulfilled.`, 'warning', emp?.photoData);
-            }
-
-            if (token.status === 'ISSUED') {
-                // Success path!
-                // 1. Show UI IMMEDIATELY (Zero Latency)
-                showScanResultModal('MEAL APPROVED', `Serving: ${token.empName}`, 'success', emp?.photoData);
-
-                // 2. Update Database Asynchronously (Fire and forget from UI perspective)
-                try {
-                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tokens', token.id), { 
-                        status: 'CONSUMED', 
-                        consumedAt: serverTimestamp(), 
-                        consumedBy: currentUser.uid,
-                        consumedBySysUser: loggedInSysUser.username 
-                    });
-                } catch (e) {
-                    console.error("Async Update Failed", e);
-                    // In a highly critical system, we might show an error later, 
-                    // but for UX speed we prioritize the happy path visuals.
-                }
-            }
-        }
 
         // --- Camera & UI ---
         window.startWebcamScanner = () => {
@@ -502,54 +528,45 @@
                 () => {}
             ).catch(err => { showToast("Camera Error", "error"); document.getElementById('webcam-modal').classList.add('hidden'); });
         };
+        
         window.stopWebcamScanner = () => {
             document.getElementById('webcam-modal').classList.add('hidden');
             if(html5QrcodeScanner) html5QrcodeScanner.stop().catch(()=>{});
+            setTimeout(() => { document.getElementById('canteen-scanner').focus(); }, 200);
         };
 
-        // Modal Timeout Variable to handle clear
-        let modalTimeoutId = null;
+        window.closeResultModal = () => {
+            if(resultModalTimer) clearTimeout(resultModalTimer);
+            document.getElementById('result-modal').classList.add('hidden');
+            document.getElementById('canteen-scanner').focus();
+        }
 
-        window.showScanResultModal = (title, message, type, photoDataStr = null) => {
+        window.showScanResultModal = (title, message, type, duration = 2000) => {
             const modal = document.getElementById('result-modal');
             const iconEl = document.getElementById('res-icon');
             const bgEl = document.getElementById('res-bg');
             document.getElementById('res-title').textContent = title;
             document.getElementById('res-msg').textContent = message;
             
-            const photoEl = document.getElementById('res-photo');
-            if (photoDataStr) {
-                photoEl.src = photoDataStr;
-                photoEl.classList.remove('hidden');
-                iconEl.classList.add('hidden');
-            } else {
-                photoEl.classList.add('hidden');
-                iconEl.classList.remove('hidden');
-                if (type === 'success') { iconEl.className = "fas fa-check-circle text-6xl text-white mb-4 drop-shadow-md"; }
-                else if (type === 'error') { iconEl.className = "fas fa-times-circle text-6xl text-white mb-4 drop-shadow-md"; }
-                else { iconEl.className = "fas fa-exclamation-circle text-6xl text-white mb-4 drop-shadow-md animate-pulse"; }
-            }
+            iconEl.classList.remove('hidden');
+            if (type === 'success') { iconEl.className = "fas fa-check-circle text-6xl text-white mb-4 drop-shadow-md"; }
+            else if (type === 'error') { iconEl.className = "fas fa-times-circle text-6xl text-white mb-4 drop-shadow-md"; }
+            else { iconEl.className = "fas fa-exclamation-circle text-6xl text-white mb-4 drop-shadow-md animate-pulse"; }
             
             modal.classList.remove('hidden');
-            if (type === 'success') bgEl.className = "bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-t-2xl p-8 text-center relative overflow-hidden";
-            else if (type === 'error') bgEl.className = "bg-gradient-to-br from-red-500 to-red-600 rounded-t-2xl p-8 text-center relative overflow-hidden";
-            else bgEl.className = "bg-gradient-to-br from-amber-500 to-amber-600 rounded-t-2xl p-8 text-center relative overflow-hidden";
+            if (type === 'success') bgEl.className = "bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-t-3xl p-8 text-center relative overflow-hidden";
+            else if (type === 'error') bgEl.className = "bg-gradient-to-br from-red-500 to-red-600 rounded-t-3xl p-8 text-center relative overflow-hidden";
+            else bgEl.className = "bg-gradient-to-br from-blue-500 to-blue-600 rounded-t-3xl p-8 text-center relative overflow-hidden";
+            
+            if (resultModalTimer) clearTimeout(resultModalTimer);
             
             if(title !== 'VERIFYING...') {
-                // Clear existing timeout if any
-                if(modalTimeoutId) clearTimeout(modalTimeoutId);
-                // Set 4 second timeout
-                modalTimeoutId = setTimeout(() => modal.classList.add('hidden'), 4000);
+                resultModalTimer = setTimeout(closeResultModal, duration); 
             }
-        };
-
-        window.dismissModal = () => {
-            document.getElementById('result-modal').classList.add('hidden');
-            if(modalTimeoutId) clearTimeout(modalTimeoutId);
         };
     </script>
 </head>
-<body class="bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 font-sans min-h-screen flex flex-col transition-colors duration-500">
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 font-sans min-h-screen flex flex-col transition-colors duration-500" onclick="keepFocus()">
 
     <!-- Navbar -->
     <nav id="main-nav" class="bg-[#0f172a] dark:bg-[#020617] text-white shadow-xl hidden sticky top-0 z-40 border-b border-slate-800">
@@ -558,7 +575,7 @@
                 <div class="bg-emerald-600 rounded-lg w-8 h-8 flex items-center justify-center shadow-[0_0_10px_rgba(16,185,129,0.4)]">
                     <i class="fas fa-utensils text-white text-sm"></i>
                 </div>
-                <span class="font-extrabold text-xl tracking-tight text-white">Canteen<span class="text-emerald-400">Counter</span></span>
+                <span class="font-extrabold text-xl tracking-tight text-white">Redemption<span class="text-emerald-400">Counter</span></span>
             </div>
             <div class="flex items-center gap-5">
                 <button id="theme-toggle-btn" onclick="toggleTheme()" class="w-8 h-8 flex items-center justify-center rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors border border-slate-700">
@@ -580,8 +597,8 @@
                 <div class="relative inline-flex rounded-full h-8 w-8 bg-emerald-500 shadow-[0_0_20px_rgba(16,185,129,0.6)]"></div>
             </div>
             <div class="mt-8 text-center space-y-2">
-                <h2 class="text-white font-bold text-xl tracking-tight">Canteen<span class="text-emerald-500">Counter</span></h2>
-                <p class="text-slate-400 text-xs uppercase tracking-[0.2em] font-medium">Syncing Meal Data</p>
+                <h2 class="text-white font-bold text-xl tracking-tight">Redemption<span class="text-emerald-500">Counter</span></h2>
+                <p class="text-slate-400 text-xs uppercase tracking-[0.2em] font-medium">Establishing Connection</p>
             </div>
         </div>
 
@@ -593,93 +610,109 @@
                         <div class="inline-flex items-center justify-center w-14 h-14 bg-emerald-600 rounded-xl mb-4 shadow-lg shadow-emerald-600/30">
                             <i class="fas fa-utensils text-2xl text-white"></i>
                         </div>
-                        <h2 class="text-2xl font-extrabold text-white mb-2">KDC Canteen Access</h2>
+                        <h2 class="text-2xl font-extrabold text-white mb-2">Canteen Access</h2>
                         <p class="text-[10px] text-slate-400 uppercase tracking-widest font-semibold">Authorized Personnel Only</p>
                     </div>
                     <form onsubmit="appLogin(event)" class="space-y-6 relative z-20">
                         <div>
                             <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-1">Terminal ID</label>
-                            <input type="text" id="login-username" class="w-full px-4 py-3 border border-[#1F2937] rounded-xl bg-[#0B1120]/80 text-sm text-slate-200 focus:border-[#34d399] focus:ring-1 focus:ring-[#34d399] outline-none transition uppercase" required placeholder="E.G. CAN-01">
+                            <input type="text" id="login-username" class="w-full px-4 py-3 border border-[#1F2937] rounded-xl bg-[#0B1120]/80 text-sm text-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 outline-none transition uppercase" required placeholder="E.G. CAN-01">
                         </div>
                         <div>
                             <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-1">Access PIN</label>
-                            <input type="password" id="login-pin" class="w-full px-4 py-3 border border-[#1F2937] rounded-xl bg-[#0B1120]/80 text-sm text-slate-200 focus:border-[#34d399] focus:ring-1 focus:ring-[#34d399] outline-none transition tracking-widest" required placeholder="••••••••">
+                            <input type="password" id="login-pin" class="w-full px-4 py-3 border border-[#1F2937] rounded-xl bg-[#0B1120]/80 text-sm text-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 outline-none transition tracking-widest" required placeholder="••••••••">
                         </div>
                         <div id="login-error" class="hidden text-red-400 text-xs text-center font-bold bg-red-500/10 py-3 rounded-lg border border-red-500/20"><i class="fas fa-shield-alt mr-2"></i> Access Denied</div>
                         <div class="pt-4">
-                            <button type="submit" class="w-full bg-[#059669] hover:bg-[#047857] text-white font-bold py-3.5 rounded-xl shadow-[0_0_20px_rgba(5,150,105,0.4)] transition-all transform active:scale-[0.98] text-sm">Initialize Service</button>
+                            <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3.5 rounded-xl shadow-[0_0_20px_rgba(16,185,129,0.4)] transition-all transform active:scale-[0.98] text-sm">Initialize Terminal</button>
                         </div>
                     </form>
                 </div>
             </div>
             <div class="w-full text-center pb-8 pt-4 relative z-20 text-[10px] text-slate-500 font-bold uppercase tracking-widest">
-                CanteenOS Service Module
+                CanteenOS Redemption Module
             </div>
         </div>
 
-        <!-- Canteen Dashboard -->
-        <div id="view-canteen" class="hidden max-w-6xl mx-auto animate-fade-in relative">
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
+        <!-- Counter Dashboard -->
+        <div id="view-counter" class="hidden max-w-7xl mx-auto animate-fade-in relative">
+            <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
                 
-                <!-- Scanner Section -->
-                <div class="bg-white dark:bg-slate-800 rounded-3xl shadow-lg border border-slate-100 dark:border-slate-700 overflow-hidden">
-                    <div class="bg-gradient-to-r from-emerald-600 to-emerald-700 p-8 text-center text-white relative overflow-hidden">
-                        <i class="fas fa-utensils text-6xl mb-3 opacity-20 absolute -right-4 -bottom-4 transform -rotate-12"></i>
-                        <h2 class="text-2xl font-extrabold relative z-10 tracking-tight">Redemption Terminal</h2>
-                        <p class="text-emerald-100 text-xs font-medium mt-1">Scan ID to Verify Meal</p>
-                    </div>
-                    <div class="p-10 flex flex-col items-center bg-slate-50 dark:bg-slate-900/50">
-                        <div class="w-full relative mb-6">
-                            <div class="absolute inset-y-0 left-6 flex items-center pointer-events-none text-emerald-400 text-xl"><i class="fas fa-barcode"></i></div>
-                            <input type="password" id="can-emp-id" inputmode="none" placeholder="SCAN CODE" class="w-full pl-16 pr-6 py-6 border-2 border-slate-300 dark:border-slate-600 rounded-2xl bg-white dark:bg-slate-900 focus:bg-white dark:focus:bg-slate-800 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/20 font-mono text-center text-3xl outline-none transition scanner-input shadow-inner text-slate-800 dark:text-white" onkeydown="handleScannerInput(event)" oninput="handleAutoScan(event)" onblur="keepFocus()" autocomplete="off" autofocus>
+                <!-- Left Column: Scanner & Overview -->
+                <div class="lg:col-span-5 space-y-6">
+                    
+                    <!-- Scanner Section -->
+                    <div class="bg-white dark:bg-slate-800 rounded-3xl shadow-lg border border-slate-100 dark:border-slate-700 overflow-hidden">
+                        <div class="bg-gradient-to-r from-emerald-600 to-emerald-700 p-8 text-center text-white relative overflow-hidden">
+                            <i class="fas fa-utensils text-6xl mb-3 opacity-20 absolute -right-4 -bottom-4 transform rotate-12"></i>
+                            <h2 class="text-2xl font-extrabold relative z-10 tracking-tight">Redemption Desk</h2>
+                            <p class="text-emerald-100 text-xs font-medium mt-1">Scan Security Token to Redeem Meal</p>
                         </div>
-                        <button onclick="startWebcamScanner()" class="w-full flex justify-center items-center text-emerald-700 dark:text-emerald-400 hover:text-emerald-800 dark:hover:text-emerald-300 font-bold text-sm bg-emerald-50 dark:bg-emerald-900/30 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 border border-emerald-200 dark:border-emerald-800 px-6 py-4 rounded-xl transition shadow-sm"><i class="fas fa-camera mr-2"></i> Activate Camera</button>
-                    </div>
-                </div>
-
-                <!-- Live Feed Section -->
-                <div class="bg-white dark:bg-slate-800 rounded-3xl shadow-sm border border-slate-200 dark:border-slate-700 p-8 h-full min-h-[500px] flex flex-col relative">
-                    <div class="flex flex-col mb-4 border-b border-slate-100 dark:border-slate-700/50 pb-3">
-                        <h3 class="text-xs font-bold text-slate-400 uppercase tracking-widest flex items-center mb-4"><i class="fas fa-concierge-bell mr-2"></i> Served Queue</h3>
-                        
-                        <!-- Stats Grid -->
-                        <div class="grid grid-cols-3 gap-2">
-                             <!-- Issued (Blue) -->
-                             <div class="bg-blue-50 dark:bg-blue-900/20 px-2 py-2 rounded-lg border border-blue-100 dark:border-blue-800/50 text-center">
-                                <span class="text-[9px] font-bold text-blue-500 uppercase tracking-wider block">Issued</span>
-                                <span id="stats-issued" class="text-lg font-black text-blue-600 dark:text-blue-400">0</span>
+                        <div class="p-8 flex flex-col items-center bg-slate-50 dark:bg-slate-900/50">
+                            <div class="w-full relative mb-6">
+                                <div class="absolute inset-y-0 left-6 flex items-center pointer-events-none text-emerald-400 text-xl"><i class="fas fa-qrcode"></i></div>
+                                <input type="password" id="canteen-scanner" inputmode="none" placeholder="SCAN TOKEN" class="w-full pl-16 pr-6 py-6 border-2 border-slate-300 dark:border-slate-600 rounded-2xl bg-white dark:bg-slate-900 focus:bg-white dark:focus:bg-slate-800 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/20 font-mono text-center text-2xl outline-none transition scanner-input shadow-inner text-slate-800 dark:text-white" onkeydown="handleScannerInput(event)" oninput="handleAutoScan(event)" onblur="keepFocus()" autocomplete="off" autofocus>
                             </div>
-
-                             <!-- Total Served (Amber) -->
-                             <div class="bg-amber-50 dark:bg-amber-900/20 px-2 py-2 rounded-lg border border-amber-100 dark:border-amber-800/50 text-center">
-                                <span class="text-[9px] font-bold text-amber-500 uppercase tracking-wider block">Total Served</span>
-                                <span id="stats-total-served" class="text-lg font-black text-amber-600 dark:text-amber-400">0</span>
-                            </div>
-
-                            <!-- My Served (Emerald) -->
-                            <div class="bg-emerald-50 dark:bg-emerald-900/20 px-2 py-2 rounded-lg border border-emerald-100 dark:border-emerald-800/50 text-center">
-                                <span class="text-[9px] font-bold text-emerald-500 uppercase tracking-wider block">My Served</span>
-                                <span id="can-today-count" class="text-lg font-black text-emerald-600 dark:text-emerald-400">0</span>
-                            </div>
+                            <button onclick="startWebcamScanner()" class="w-full flex justify-center items-center text-emerald-600 dark:text-emerald-400 hover:text-emerald-800 dark:hover:text-emerald-300 font-bold text-sm bg-emerald-50 dark:bg-emerald-900/30 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 border border-emerald-200 dark:border-emerald-800 px-6 py-4 rounded-xl transition shadow-sm"><i class="fas fa-camera mr-2"></i> Activate Optical Scanner</button>
                         </div>
                     </div>
-                    <div id="can-recent-list" class="space-y-3 overflow-y-auto flex-grow pr-2 h-[400px]"></div>
+
+                    <!-- Metrics Grid (Global Tracking) -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="bg-white dark:bg-slate-800 p-5 rounded-3xl border border-slate-100 dark:border-slate-700 shadow-sm flex flex-col justify-center relative overflow-hidden">
+                            <div class="absolute -right-4 -bottom-4 text-indigo-500/10 dark:text-indigo-500/20 text-6xl pointer-events-none"><i class="fas fa-clipboard-check"></i></div>
+                            <span class="text-slate-500 dark:text-slate-400 text-[10px] font-bold uppercase tracking-widest mb-2 relative z-10">Total Assigned</span>
+                            <span id="stat-issued-alc" class="text-4xl font-black text-indigo-600 dark:text-indigo-400 relative z-10">0</span>
+                        </div>
+                        <div class="bg-white dark:bg-slate-800 p-5 rounded-3xl border border-slate-100 dark:border-slate-700 shadow-sm flex flex-col justify-center relative overflow-hidden">
+                            <div class="absolute -right-4 -bottom-4 text-emerald-500/10 dark:text-emerald-500/20 text-6xl pointer-events-none"><i class="fas fa-utensils"></i></div>
+                            <span class="text-slate-500 dark:text-slate-400 text-[10px] font-bold uppercase tracking-widest mb-2 relative z-10">Total Redeemed</span>
+                            <span id="stat-redeemed-emp" class="text-4xl font-black text-emerald-600 dark:text-emerald-400 relative z-10">0</span>
+                        </div>
+                    </div>
+
                 </div>
+
+                <!-- Right Column: Details & Live Feed -->
+                <div class="lg:col-span-7 flex flex-col gap-6">
+                    
+                    <!-- Global Meal Breakdown Tracker -->
+                    <div class="bg-white dark:bg-slate-800 rounded-3xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
+                        <h3 class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-widest mb-4 flex items-center"><i class="fas fa-chart-pie mr-2 text-indigo-400"></i> Live Meal Varieties Tracker</h3>
+                        <div id="meal-breakdown-container" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <!-- Dynamic Breakdown Counts Injected Here -->
+                        </div>
+                    </div>
+
+                    <!-- Live Feed Section -->
+                    <div class="bg-white dark:bg-slate-800 rounded-3xl shadow-sm border border-slate-200 dark:border-slate-700 p-6 flex-grow flex flex-col min-h-[400px]">
+                        <div class="flex justify-between items-center mb-4 border-b border-slate-100 dark:border-slate-700/50 pb-4">
+                            <h3 class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-widest flex items-center"><i class="fas fa-history mr-2"></i> Today's Counter Ledger</h3>
+                        </div>
+                        <div id="canteen-list" class="overflow-y-auto pr-2 flex-grow h-[300px]"></div>
+                    </div>
+
+                </div>
+
             </div>
         </div>
     </main>
 
-    <!-- Result Modal -->
-    <div id="result-modal" class="fixed inset-0 hidden z-[80] flex items-end sm:items-center justify-center pointer-events-none p-4">
-        <div class="bg-white dark:bg-slate-800 w-full max-w-sm rounded-3xl shadow-2xl pointer-events-auto transform transition-all scale-100 overflow-hidden border border-slate-100 dark:border-slate-700">
-            <div id="res-bg" class="rounded-t-3xl p-8 text-center flex flex-col items-center">
-                <i id="res-icon" class="text-6xl text-white mb-4 drop-shadow-md"></i>
-                <img id="res-photo" class="h-28 w-28 rounded-2xl object-cover border-4 border-white dark:border-slate-700 mb-5 shadow-lg hidden" src="">
-                <h2 id="res-title" class="text-2xl font-black text-white tracking-tight drop-shadow-sm"></h2>
+    <!-- Verification Result Modal (5s notification for Meal Type) -->
+    <div id="result-modal" class="fixed inset-0 hidden z-[80] flex items-end sm:items-center justify-center pointer-events-none p-4 backdrop-blur-sm bg-slate-900/40">
+        <div class="bg-white dark:bg-slate-800 w-full max-w-md rounded-3xl shadow-2xl pointer-events-auto transform transition-all scale-100 overflow-hidden border border-slate-100 dark:border-slate-700 relative">
+            
+            <button onclick="closeResultModal()" class="absolute top-4 right-4 z-20 w-8 h-8 flex items-center justify-center bg-black/20 hover:bg-black/40 text-white rounded-full transition-colors backdrop-blur-md">
+                <i class="fas fa-times text-sm"></i>
+            </button>
+
+            <div id="res-bg" class="rounded-t-3xl p-8 text-center flex flex-col items-center relative overflow-hidden">
+                <i id="res-icon" class="text-6xl text-white mb-4 drop-shadow-md relative z-10"></i>
+                <h2 id="res-title" class="text-2xl font-black text-white tracking-tight drop-shadow-sm relative z-10"></h2>
             </div>
             <div class="p-8 text-center bg-slate-50 dark:bg-slate-900/50">
-                <p id="res-msg" class="text-slate-800 dark:text-white font-bold text-xl leading-relaxed mb-6"></p>
-                <button onclick="dismissModal()" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-300 font-bold py-3 rounded-xl shadow-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition pointer-events-auto">DISMISS</button>
+                <p id="res-msg" class="text-slate-800 dark:text-white font-bold text-xl leading-relaxed whitespace-pre-line"></p>
+                <button onclick="closeResultModal()" class="mt-8 w-full py-3.5 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 text-slate-500 dark:text-slate-400 font-bold rounded-xl text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors uppercase tracking-wider">Acknowledge</button>
             </div>
         </div>
     </div>
@@ -687,8 +720,9 @@
     <!-- Webcam Modal -->
     <div id="webcam-modal" class="fixed inset-0 bg-[#0B1120]/95 hidden z-[90] flex flex-col items-center justify-center p-4 backdrop-blur-sm">
         <div class="bg-[#131B2B] rounded-3xl overflow-hidden w-full max-w-md relative shadow-2xl border border-slate-800">
-            <div class="bg-[#1F2937] text-white p-5 flex justify-between items-center border-b border-slate-700"><span class="font-bold flex items-center text-sm uppercase tracking-wider"><i class="fas fa-video mr-3 text-blue-500"></i> Scanning</span><button onclick="stopWebcamScanner()" class="text-slate-400 hover:text-white bg-slate-800 hover:bg-red-500 rounded-lg p-2 transition"><i class="fas fa-times"></i></button></div>
+            <div class="bg-[#1F2937] text-white p-5 flex justify-between items-center border-b border-slate-700"><span class="font-bold flex items-center text-sm uppercase tracking-wider"><i class="fas fa-video mr-3 text-emerald-500"></i> Optical Feed Active</span><button onclick="stopWebcamScanner()" class="text-slate-400 hover:text-white bg-slate-800 hover:bg-red-500 rounded-lg p-2 transition"><i class="fas fa-times"></i></button></div>
             <div id="reader" class="w-full bg-[#0B1120] min-h-[350px]"></div>
+            <div class="p-5 text-center text-xs font-bold uppercase tracking-widest text-emerald-400 bg-[#1F2937] border-t border-slate-700">Awaiting QR / Barcode Interface...</div>
         </div>
     </div>
 
